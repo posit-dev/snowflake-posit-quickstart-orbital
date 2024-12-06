@@ -1,0 +1,308 @@
+---
+title: "Refitting Models in Snowflake, using Posit Connect"
+---
+
+```{r setup}
+#| echo: false
+#| include: false
+
+library(odbc)
+library(DBI)
+library(dbplyr)
+library(tidyverse)
+library(glue)
+library(tidymodels)
+library(vetiver)
+library(pins)
+library(arrow)
+
+# Use SSH key if on Connect, otherwise use managed credentials
+if (Sys.getenv("RSTUDIO_PRODUCT") == "CONNECT"){
+  
+  # grab base64-encoded ssh key from environment variable and cache as tempfile
+  cached_key <- tempfile()
+  readr::write_file(openssl::base64_decode(Sys.getenv("SNOWFLAKE_SSH_KEY")), file = cached_key)
+  
+  # The ambient credential feature in odbc::snowflake() causes unexpected overwrites, so we'll use the basic Snowflake driver.
+  con <- dbConnect(
+    odbc::odbc(),
+    driver = "Snowflake",
+    server = paste0(Sys.getenv("SNOWFLAKE_ACCOUNT"), ".snowflakecomputing.com"),
+    uid = "SVC_SOLENG",
+    role = "SOLENG",
+    warehouse = "DEFAULT_WH",
+    database = "LENDING_CLUB",
+    schema = "PUBLIC",
+    # Settings to set Snowflake key-pair auth
+    authenticator = "SNOWFLAKE_JWT",
+    PRIV_KEY_FILE = cached_key
+  )
+  
+} else {
+
+  con <- dbConnect(
+    odbc::snowflake(),
+    warehouse = "DEFAULT_WH",
+    database = "LENDING_CLUB",
+    schema = "PUBLIC"
+  )
+
+}
+
+```
+
+## Model Monitoring
+
+First, let's find our active model version
+
+<!-- 
+IMPORTANT -- if you're running this for the first time, you may run into namespacing errors in Connect or permissioning errors in Snowflake. That means someone has already run this with the same `model_name` -- to run this flawlessly, pick a new model_name below.
+-->
+
+```{r}
+model_name <- "r-interest-rate"
+
+board <- board_connect()
+
+model_versions <- board |>
+  pin_versions(glue("{board$account}/{model_name}"))
+
+model_versions
+
+```
+
+```{r}
+model_version <- model_versions |>
+  filter(active) |>
+  pull(version)
+```
+
+### Compute Performance Statistics
+
+```{r}
+lendingclub_dat <- con |> tbl("LOAN_DATA") |>
+  mutate(ISSUE_YEAR = as.integer(str_sub(ISSUE_D, start = 5)),
+         ISSUE_MONTH = as.integer(case_match(
+           str_sub(ISSUE_D, end = 3),
+          "Jan" ~ 1,
+          "Feb" ~ 2,
+          "Mar" ~ 3,
+          "Apr" ~ 4,
+          "May" ~ 5,
+          "Jun" ~ 6,
+          "Jul" ~ 7,
+          "Aug" ~ 8,
+          "Sep" ~ 9,
+          "Oct" ~ 10,
+          "Nov" ~ 11,
+          "Dec" ~ 12
+           ))
+         ) |>
+  filter(ISSUE_YEAR >= 2016, ISSUE_YEAR < 2018)
+```
+
+We'll use the view we fit with this model version to compute predictions
+
+```{r}
+
+lendingclub_predictions <- con |> tbl(glue("{model_name}_v{model_version}"))
+
+existing_predictions <- lendingclub_dat |>
+  left_join(lendingclub_predictions, by = "ID") |>
+  select(ID, ISSUE_YEAR, ISSUE_MONTH, INT_RATE, .pred) |>
+  collect()
+
+```
+
+### Model Performance Over Time
+
+```{r}
+# Extract the metrics from our last model run
+extracted_metrics <- board |>
+    pin_meta(glue("{board$account}/{model_name}")) %>% 
+    pluck("user", "metrics") %>% 
+    as_tibble()
+
+metrics <- existing_predictions |>
+  mutate(date = ymd(glue("{ISSUE_YEAR}-{str_pad(ISSUE_MONTH, 2, pad=0)}-01"))) |>
+  arrange(date) |>
+  vetiver_compute_metrics(date, "month", INT_RATE, .pred)
+
+metrics |> 
+  vetiver_plot_metrics() +
+    geom_hline(aes(yintercept = .estimate, color = .metric), 
+               data = extracted_metrics,
+               linewidth = 1.5, alpha = 0.7, lty = 2)
+
+```
+
+## Retraining our Model on New Data
+
+Let's grab a sample of 20k rows to refit.
+
+```{r}
+
+lendingclub_prep <- lendingclub_dat |>
+  slice_sample(n = 20000) |>
+  select(INT_RATE, TERM, BC_UTIL, BC_OPEN_TO_BUY, ALL_UTIL) |> 
+  mutate(
+    INT_RATE = as.numeric(stringr::str_remove(INT_RATE, "%"))
+    ) |>
+  filter(!if_any(everything(), is.na)) |>
+  collect()
+```
+
+Now, let's refit our model on the new data!
+
+```{r}
+lendingclub_rec <- recipe(INT_RATE ~ ., data = lendingclub_prep) |>
+  step_mutate(TERM = (TERM == "60 months")) |>
+  # step_dummy(TERM) |>
+  # step_mutate(TERM = trimws(substr(TERM, 1,4))) |> 
+  step_mutate(across(!TERM, as.numeric)) |> 
+  step_normalize(all_numeric_predictors()) |>
+  step_impute_mean(all_of(c("BC_OPEN_TO_BUY", "BC_UTIL"))) |>   
+  step_filter(!if_any(everything(), is.na))
+
+
+lendingclub_lr <- linear_reg()
+
+lendingclub_wf <- workflow() |> 
+  add_model(lendingclub_lr) |> 
+  add_recipe(lendingclub_rec)
+
+lendingclub_fit <- lendingclub_wf |> 
+  fit(data = lendingclub_prep)
+```
+
+### Model Statistics
+
+```{r}
+lendingclub_metric_set <- metric_set(rmse, mae, rsq)
+
+lendingclub_metrics <- lendingclub_fit |>
+  augment(lendingclub_prep) |>
+  lendingclub_metric_set(truth = INT_RATE, estimate = .pred)
+
+lendingclub_metrics
+```
+
+### Selecting the best model
+
+We'll select the best model based on which has the lowest RMSE
+
+```{r}
+#| output: asis
+
+old_rmse <- extracted_metrics |>
+  filter(.metric == "rmse") |>
+  pull(.estimate) |>
+  round(digits = 4)
+
+new_rmse <- lendingclub_metrics |>
+  filter(.metric == "rmse") |>
+  pull(.estimate) |>
+  round(digits = 4)
+
+if (old_rmse > new_rmse) {
+  update_model <- TRUE
+  cat(
+    "\n::: {.callout-tip}",
+    "## Model Will Be Updated",
+    glue("New Model RMSE of {new_rmse} is lower than the Previous RMSE of {old_rmse}. Updating model in Snowflake!"),
+    ":::\n",
+    sep = "\n"
+  )
+} else {
+  update_model <- FALSE
+  cat(
+    "\n::: {.callout-important}",
+    "## Model Will Not Be Updated",
+    glue("New Model RMSE of {new_rmse} is higher than the Previous RMSE of {old_rmse}. No updates will occur. Please note that the cells following this block will not be evaluated."),
+    ":::\n",
+    sep = "\n"
+  )
+}
+
+```
+
+### Updating the Model
+
+Note that all of these code blocks use `if (update_model){...}` -- that uses the update_model flag set in the previous code chunk to control execution.
+
+#### Pin the new version to Posit Connect
+
+```{r}
+
+if (update_model){ 
+  v <- vetiver_model(lendingclub_fit, model_name, metadata = list(metrics = lendingclub_metrics)) 
+  
+  board |> 
+    vetiver_pin_write(v)
+
+  model_versions <- board |>
+    pin_versions(glue("{board$account}/{model_name}"))
+  
+  model_version <- model_versions |>
+    filter(active) |>
+    pull(version) 
+}
+```
+
+#### Create an orbital object
+
+```{r}
+
+if (update_model){
+
+  library(orbital) 
+  library(tidypredict)
+  
+  orbital_obj <- orbital(lendingclub_fit)
+  
+  ## Add predictions column to table
+  
+  res <- tbl(con, "LOAN_DATA") |>
+    mutate(!!!orbital_inline(orbital_obj))
+  
+  # select only the prediction column and the ID column
+  
+  pred_name <- ".pred" 
+  res <- select(res, any_of(c("ID", pred_name)))
+  
+  # Translate the dbplyr `tbl` into a sql query string
+  
+  generated_sql <- remote_query(res) 
+}
+
+```
+
+Translate the generated SQL into a Snowflake View. We'll start by creating a 'versioned' view, linked to the version of the model we just fit.
+
+```{r}
+if (update_model){ 
+  
+  versioned_view_name <- glue("{model_name}_v{model_version}") 
+  snowflake_view_statement <- glue::glue_sql( "CREATE OR REPLACE VIEW {`versioned_view_name`} AS ", generated_sql, .con = con )
+
+  con |> DBI::dbExecute(snowflake_view_statement) 
+  
+}
+```
+
+We'll next create a 'main' view, which we'll keep updated to match the latest version of the model. This will allow downstream projects to always reference this view, and get the latest updates.
+
+```{r}
+if (update_model){
+
+  main_view_name <- glue("{model_name}_latest")
+  main_view_statement <- glue::glue_sql(
+    "CREATE OR REPLACE VIEW {`main_view_name`} AS ",
+    "SELECT * FROM {`versioned_view_name`}",
+    .con = con
+  )
+  
+  con |> DBI::dbExecute(main_view_statement)
+  
+}
+```
