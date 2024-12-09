@@ -24,6 +24,7 @@ if (Sys.getenv("RSTUDIO_PRODUCT") == "CONNECT"){
   readr::write_file(openssl::base64_decode(Sys.getenv("SNOWFLAKE_SSH_KEY")), file = cached_key)
   
   # The ambient credential feature in odbc::snowflake() causes unexpected overwrites, so we'll use the basic Snowflake driver.
+  # Change arguments to match your own credentials and other information
   con <- dbConnect(
     odbc::odbc(),
     driver = "Snowflake",
@@ -157,8 +158,6 @@ Now, let's refit our model on the new data!
 ```{r}
 lendingclub_rec <- recipe(INT_RATE ~ ., data = lendingclub_prep) |>
   step_mutate(TERM = (TERM == "60 months")) |>
-  # step_dummy(TERM) |>
-  # step_mutate(TERM = trimws(substr(TERM, 1,4))) |> 
   step_mutate(across(!TERM, as.numeric)) |> 
   step_normalize(all_numeric_predictors()) |>
   step_impute_mean(all_of(c("BC_OPEN_TO_BUY", "BC_UTIL"))) |>   
