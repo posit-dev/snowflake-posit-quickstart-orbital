@@ -60,7 +60,7 @@ IMPORTANT -- if you're running this for the first time, you may run into namespa
 -->
 
 ```{r}
-model_name <- "r-interest-rate"
+model_name <- "interest_rate_prediction"
 
 board <- board_connect()
 
